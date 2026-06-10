@@ -1,11 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10,<3.15"
 # dependencies = [
 #   "numpy>=1.24",
 #   "JACK-Client>=0.5.4",
 #   "sounddevice>=0.4.6",
 #   "python-rtmidi>=1.5",
+#   "LinkPython-extern>=1.2.1",
 # ]
 # ///
 #
@@ -17,6 +18,7 @@
 # audio-to-MIDI-clock bridge:
 #
 #   audio in (JACK/pipewire or ALSA)  ->  BTrack  ->  MIDI clock out (24 ppqn)
+#                                                 ->  Ableton Link (--link)
 #
 # Run it with uv (https://docs.astral.sh/uv/) - dependencies are resolved
 # automatically:
@@ -403,6 +405,7 @@ class ClockEngine:
         self.tick_count = 0
         self.nudge_per_tick = 0.0
         self.nudge_ticks_left = 0
+        self.beat_anchor = None  # (time, beat number) of the last beat tick
 
         self.beat_times = deque(maxlen=16)
         self.last_beat_time = 0.0
@@ -489,6 +492,7 @@ class ClockEngine:
         first = beat_time + self.offset_s + period
         self.next_tick_time = first
         self.tick_count = 0
+        self.beat_anchor = None
         self.ticking = True
         self.nudge_ticks_left = 0
         self.nudge_per_tick = 0.0
@@ -524,10 +528,12 @@ class ClockEngine:
             tick_interval = (60.0 / self.clock_bpm) / self.PPQN
             while self.next_tick_time < until:
                 t = self.next_tick_time
-                if self.pending_start and self.tick_count % self.PPQN == 0:
-                    self.pending_start = False
-                    self.transport_running = True
-                    events.append((max(now, t - 0.001), MIDI_START))
+                if self.tick_count % self.PPQN == 0:
+                    self.beat_anchor = (t, self.tick_count // self.PPQN)
+                    if self.pending_start:
+                        self.pending_start = False
+                        self.transport_running = True
+                        events.append((max(now, t - 0.001), MIDI_START))
                 events.append((t, MIDI_CLOCK))
                 self.last_tick_sent = t
                 step = tick_interval
@@ -579,7 +585,79 @@ class ClockEngine:
                 "multiplier": self.multiplier,
                 "input_db": self.input_db,
                 "last_beat": self.last_beat_time,
+                "beat_anchor": self.beat_anchor,
             }
+
+
+# ======================================================================
+# Ableton Link publisher (--link): bridges the clock engine into a Link
+# session so DAWs with native Link support (Reaper, Bitwig, ...) can sync
+# without MIDI. Periodically re-forcing the Link beat/time mapping from an
+# external clock is the use Link's own forceBeatAtTime documentation
+# sanctions for bridging an outside clock source into a session.
+# ======================================================================
+class LinkPublisher(threading.Thread):
+    def __init__(self, engine, clock_now, quantum, stop_event):
+        super().__init__(daemon=True, name="link-publisher")
+        import link  # LinkPython-extern
+        self.engine = engine
+        self.clock_now = clock_now
+        self.quantum = float(quantum)
+        self.stop_event = stop_event
+        self.link = link.Link(engine.clock_bpm)
+        self.link.startStopSyncEnabled = True
+        self.link.enabled = True
+        self.peers = 0
+        self.tempo = engine.clock_bpm
+        self._was_running = False
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                self._publish()
+            except Exception:
+                pass  # never let a Link hiccup take the clock down
+            self.stop_event.wait(0.25)
+        self.link.enabled = False
+
+    def _publish(self):
+        snap = self.engine.snapshot()
+        now_us = self.link.clock().micros()
+        # bridge between the audio backend's timebase and Link's clock;
+        # re-sampled every iteration so slow drift between the two is absorbed
+        offset_us = now_us - self.clock_now() * 1e6
+
+        state = self.link.captureAppSessionState()
+        dirty = False
+
+        if snap["ticking"]:
+            bpm = snap["clock_bpm"]
+            if abs(state.tempo() - bpm) > 0.01:
+                state.setTempo(bpm, now_us)
+                dirty = True
+
+            anchor = snap["beat_anchor"]
+            if anchor is not None:
+                anchor_time, anchor_beat = anchor
+                anchor_us = int(anchor_time * 1e6 + offset_us)
+                error = state.beatAtTime(anchor_us, self.quantum) - anchor_beat
+                error = (error + 0.5) % 1.0 - 0.5  # beat-phase error
+                # only re-force the mapping when actually drifted, so Link
+                # peers aren't disturbed every iteration
+                if abs(error) > 0.05:
+                    state.forceBeatAtTime(float(anchor_beat), anchor_us, self.quantum)
+                    dirty = True
+
+        if self.engine.send_start_stop and snap["running"] != self._was_running:
+            state.setIsPlaying(snap["running"], now_us)
+            self._was_running = snap["running"]
+            dirty = True
+
+        if dirty:
+            self.link.commitAppSessionState(state)
+
+        self.peers = self.link.numPeers()
+        self.tempo = state.tempo()
 
 
 # ======================================================================
@@ -679,11 +757,17 @@ def run_jack(args, make_worker):
     def shutdown(status, reason):
         stop_event.set()
 
+    clock_now = lambda: client.frame_time / sample_rate  # noqa: E731
+
     with client:
         worker.start()
+        link_pub = None
+        if args.link:
+            link_pub = LinkPublisher(engine, clock_now, args.link_quantum, stop_event)
+            link_pub.start()
         run_ui(args, engine, worker, stop_event,
                backend=f"jack/pipewire {int(sample_rate)} Hz",
-               clock_now=lambda: client.frame_time / sample_rate)
+               clock_now=clock_now, link_pub=link_pub)
     return 0
 
 
@@ -731,9 +815,14 @@ def run_alsa(args, make_worker):
     with stream:
         worker.start()
         sender.start()
+        link_pub = None
+        if args.link:
+            link_pub = LinkPublisher(engine, time.perf_counter,
+                                     args.link_quantum, stop_event)
+            link_pub.start()
         run_ui(args, engine, worker, stop_event,
                backend=f"alsa ({device_info['name']}) {int(sample_rate)} Hz",
-               clock_now=time.perf_counter)
+               clock_now=time.perf_counter, link_pub=link_pub)
     midi.close_port()
     return 0
 
@@ -741,7 +830,7 @@ def run_alsa(args, make_worker):
 # ======================================================================
 # Terminal UI: status line + keyboard controls
 # ======================================================================
-def run_ui(args, engine, worker, stop_event, backend, clock_now):
+def run_ui(args, engine, worker, stop_event, backend, clock_now, link_pub=None):
     interactive = sys.stdin.isatty() and not args.no_keys
     old_attrs = None
     if interactive:
@@ -751,6 +840,9 @@ def run_ui(args, engine, worker, stop_event, backend, clock_now):
         tty.setcbreak(sys.stdin.fileno())
 
     print(f"btrack_clock | backend: {backend}")
+    if link_pub is not None:
+        print(f"ableton link: enabled (quantum {link_pub.quantum:g}) - "
+              f"turn on Link in Reaper/Bitwig and they will find this session")
     print(f"route audio into '{args.client_name}:audio_in' and MIDI out of "
           f"'{args.client_name}:midi_clock_out' (qpwgraph / helvum / aconnect)")
     if interactive:
@@ -794,10 +886,11 @@ def run_ui(args, engine, worker, stop_event, backend, clock_now):
             if s["multiplier"] != 1.0:
                 flags.append(f"x{s['multiplier']:g}")
             flags.append("run" if s["running"] else "stop")
+            link_part = (f"link {link_pub.peers}p | " if link_pub is not None else "")
             line = (f"\r{spinner[n % 4]} beat {beat_flash} "
                     f"track {s['tracker_bpm']:6.1f} bpm | "
                     f"clock {s['clock_bpm']:6.1f} bpm [{lock}] | "
-                    f"in {s['input_db']:6.1f} dB | {' '.join(flags)}   ")
+                    f"{link_part}in {s['input_db']:6.1f} dB | {' '.join(flags)}   ")
             sys.stdout.write(line)
             sys.stdout.flush()
             n += 1
@@ -896,8 +989,14 @@ def main():
     parser.add_argument("--offset-ms", type=float, default=0.0,
                         help="shift the clock relative to detected beats, in ms "
                              "(negative = clock earlier)")
+    parser.add_argument("--link", action="store_true",
+                        help="also publish the clock as an Ableton Link session "
+                             "(for Reaper/Bitwig and other Link-capable apps)")
+    parser.add_argument("--link-quantum", type=float, default=4.0,
+                        help="Ableton Link quantum in beats (default: 4)")
     parser.add_argument("--no-start-stop", action="store_true",
-                        help="never send MIDI Start/Stop, only clock ticks")
+                        help="never send MIDI Start/Stop or Link transport, "
+                             "only tempo/clock")
     parser.add_argument("--no-keys", action="store_true",
                         help="disable keyboard controls")
     parser.add_argument("--input-device", default=None,
@@ -919,6 +1018,15 @@ def main():
         import sounddevice as sd
         print(sd.query_devices())
         sys.exit(0)
+
+    if args.link:
+        try:
+            import link  # noqa: F401
+        except ImportError as exc:
+            print(f"error: --link needs the LinkPython-extern package ({exc}).\n"
+                  "Run this script with uv ('uv run btrack_clock.py') so all "
+                  "dependencies are installed automatically.", file=sys.stderr)
+            sys.exit(1)
 
     def make_worker(sample_rate, audio_queue, stop_event):
         engine = ClockEngine(
