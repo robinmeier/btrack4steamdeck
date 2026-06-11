@@ -42,8 +42,9 @@ In Desktop Mode, open Konsole. Everything is user-space — no
    Or clone the repo and `uv run btrack_clock.py` / `./btrack_clock.py`.
 
 3. Route things in **qpwgraph** (or Helvum):
-   - connect your audio source's output (e.g. *Firefox*) to **BTrack:audio_in**.
-     Tip: also leave the source connected to your speakers so you still hear it.
+   - connect your audio source's output (e.g. *Firefox*) to the **BTrack**
+     capture node. Tip: also leave the source connected to your speakers so
+     you still hear it. (Or start with `--pw-target <node>`.)
    - **OP-Z / hardware**: plug it in via USB; PipeWire bridges its ALSA MIDI
      port into the graph — connect **BTrack:midi_clock_out** directly to it.
    - **Reaper / Bitwig**: use Ableton Link instead of MIDI clock — run with
@@ -67,12 +68,17 @@ same internal clock and stay in step with each other.
 
 ## What it does
 
-- **Audio in / MIDI out via pipewire-jack** — appears as a `BTrack` client
-  with an `audio_in` and a `midi_clock_out` port, with sample-accurate clock
-  ticks generated in the JACK process callback. If libjack isn't available
-  it falls back automatically to ALSA (`sounddevice` capture +
-  `python-rtmidi` virtual MIDI port), which PipeWire bridges into the graph
-  as well.
+- **Native PipeWire backend (default)** — audio comes in through a
+  `pw-record` stream node (part of the stock `pipewire` package), named
+  `BTrack` in qpwgraph and resampled by PipeWire itself; the MIDI clock
+  goes out an ALSA-sequencer port that PipeWire's Midi-Bridge exposes in
+  the graph (and which Bitwig can see, unlike JACK MIDI ports). This path
+  avoids both the pipewire-jack and PortAudio layers, which are flaky on
+  some SteamOS installs.
+- **Fallbacks**: if `pw-record` is missing, the pipewire-jack backend is
+  tried (one JACK client, sample-accurate ticks in the process callback),
+  then plain ALSA (`sounddevice` capture). Force one with
+  `--backend pipewire|jack|alsa`.
 - **24 ppqn MIDI clock** with a PLL-style follower: the tempo is estimated
   from median inter-beat intervals (finer resolution than the tracker's
   internal quantized tempo), and tick phase is gently nudged onto detected
@@ -95,7 +101,8 @@ same internal clock and stay in step with each other.
 ## Options
 
 ```
---backend auto|jack|alsa   backend selection (default: auto)
+--backend auto|pipewire|jack|alsa   backend (auto = pipewire, then jack, then alsa)
+--pw-target NODE           pipewire backend: capture from this node
 --client-name NAME         node name in qpwgraph (default: BTrack)
 --min-bpm / --max-bpm      tempo fold range, must span an octave (80–160)
 --phase-gain G             beat-phase correction strength 0..1 (0.15)
@@ -128,6 +135,7 @@ uv run btrack_clock.py --selftest             # tracker on synthetic audio
 uv run --with numpy python3 tests/test_clock_engine.py   # clock PLL behavior
 uv run --with numpy python3 tests/compare_with_cpp.py    # vs. original C++ (needs g++)
 uv run --with numpy --with LinkPython-extern python3 tests/test_link_publisher.py  # Link session
+uv run --with numpy python3 tests/test_pipewire_reader.py  # pw-record stream reader
 ```
 
 ## License

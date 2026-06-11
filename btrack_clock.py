@@ -42,8 +42,11 @@ import argparse
 import math
 import queue
 import select
+import shutil
 import statistics
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -772,10 +775,132 @@ def run_jack(args, make_worker):
 
 
 # ======================================================================
+# Shared ALSA-sequencer MIDI clock output (used by the pipewire and alsa
+# backends). PipeWire's Midi-Bridge exposes the port in the graph.
+# ======================================================================
+def start_rtmidi_clock(engine, stop_event, client_name):
+    import rtmidi
+
+    midi = rtmidi.MidiOut(rtapi=rtmidi.API_LINUX_ALSA, name=client_name)
+    midi.open_virtual_port("midi_clock_out")
+
+    def clock_thread():
+        while not stop_event.is_set():
+            now = time.perf_counter()
+            events = engine.poll(now, now + 0.010)
+            for t, msg in events:
+                wait = t - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                midi.send_message(list(msg))
+            time.sleep(0.002)
+
+    threading.Thread(target=clock_thread, daemon=True, name="midi-clock").start()
+    return midi
+
+
+# ======================================================================
+# Native PipeWire backend: audio in through a pw-record stream node
+# (part of the stock pipewire package) + ALSA-seq MIDI clock out. Avoids
+# both the pipewire-jack and PortAudio layers.
+# ======================================================================
+PW_HOP = 512
+
+
+def pw_record_command(args):
+    cmd = [
+        "pw-record", "--raw",
+        "--format", "f32",
+        "--rate", str(int(BTRACK_SR)),
+        "--channels", "1",
+        "--latency", f"{PW_HOP}/{int(BTRACK_SR)}",
+        "-P", '{ node.name = "%s" }' % args.client_name,
+    ]
+    if args.pw_target is not None:
+        cmd += ["--target", args.pw_target]
+    cmd.append("-")
+    return cmd
+
+
+def pipewire_reader(stdout, audio_queue, stop_event, on_eof):
+    hop_bytes = PW_HOP * 4  # f32 mono
+    samples_read = 0
+    anchor = None  # estimated stream start, in perf_counter terms
+    while not stop_event.is_set():
+        data = stdout.read(hop_bytes)
+        if not data or len(data) < hop_bytes:
+            on_eof()
+            return
+        samples_read += PW_HOP
+        # smooth timestamps: pipe batching only ever delays reads, so the
+        # stream start is the minimum of (read time - samples elapsed); a
+        # slight upward creep absorbs drift between the audio clock and
+        # perf_counter
+        estimate = time.perf_counter() - samples_read / BTRACK_SR
+        if anchor is None:
+            anchor = estimate
+        else:
+            anchor = min(anchor, estimate) + 0.0005 * max(estimate - anchor, 0.0)
+        block_time = anchor + (samples_read - PW_HOP) / BTRACK_SR
+        block = np.frombuffer(data, dtype="<f4").astype(np.float64)
+        try:
+            audio_queue.put_nowait((block_time, block))
+        except queue.Full:
+            pass
+
+
+def run_pipewire(args, make_worker):
+    if shutil.which("pw-record") is None:
+        raise RuntimeError("pw-record not found (pipewire package)")
+
+    stderr_file = tempfile.TemporaryFile()
+    proc = subprocess.Popen(pw_record_command(args),
+                            stdout=subprocess.PIPE, stderr=stderr_file)
+
+    # let pw-record fail fast (no daemon, unsupported option, ...)
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        stderr_file.seek(0)
+        message = stderr_file.read().decode(errors="replace").strip()
+        raise RuntimeError(f"pw-record exited: {message or proc.returncode}")
+
+    stop_event = threading.Event()
+    audio_queue = queue.Queue(maxsize=64)
+    engine, worker = make_worker(BTRACK_SR, audio_queue, stop_event)
+
+    def on_eof():
+        if not stop_event.is_set():
+            print("\nerror: pw-record stream ended", file=sys.stderr)
+            stop_event.set()
+
+    reader = threading.Thread(
+        target=pipewire_reader,
+        args=(proc.stdout, audio_queue, stop_event, on_eof),
+        daemon=True, name="pw-reader")
+
+    midi = start_rtmidi_clock(engine, stop_event, args.client_name)
+    try:
+        worker.start()
+        reader.start()
+        link_pub = None
+        if args.link:
+            link_pub = LinkPublisher(engine, time.perf_counter,
+                                     args.link_quantum, stop_event)
+            link_pub.start()
+        run_ui(args, engine, worker, stop_event,
+               backend=f"pipewire (pw-record) {int(BTRACK_SR)} Hz",
+               clock_now=time.perf_counter, link_pub=link_pub)
+    finally:
+        proc.terminate()
+        midi.close_port()
+        stderr_file.close()
+    return 0
+
+
+# ======================================================================
 # ALSA fallback backend: sounddevice in + python-rtmidi clock out
 # ======================================================================
 def run_alsa(args, make_worker):
-    import rtmidi
     import sounddevice as sd
 
     if args.input_device is not None:
@@ -783,9 +908,6 @@ def run_alsa(args, make_worker):
 
     device_info = sd.query_devices(kind="input")
     sample_rate = float(device_info["default_samplerate"])
-
-    midi = rtmidi.MidiOut(rtapi=rtmidi.API_LINUX_ALSA, name=args.client_name)
-    midi.open_virtual_port("midi_clock_out")
 
     stop_event = threading.Event()
     audio_queue = queue.Queue(maxsize=64)
@@ -798,23 +920,11 @@ def run_alsa(args, make_worker):
         except queue.Full:
             pass
 
-    def clock_thread():
-        while not stop_event.is_set():
-            now = time.perf_counter()
-            events = engine.poll(now, now + 0.010)
-            for t, msg in sorted(events):
-                wait = t - time.perf_counter()
-                if wait > 0:
-                    time.sleep(wait)
-                midi.send_message(list(msg))
-            time.sleep(0.002)
-
     stream = sd.InputStream(channels=1, samplerate=sample_rate,
                             blocksize=512, callback=audio_callback)
-    sender = threading.Thread(target=clock_thread, daemon=True, name="midi-clock")
+    midi = start_rtmidi_clock(engine, stop_event, args.client_name)
     with stream:
         worker.start()
-        sender.start()
         link_pub = None
         if args.link:
             link_pub = LinkPublisher(engine, time.perf_counter,
@@ -840,11 +950,11 @@ def run_ui(args, engine, worker, stop_event, backend, clock_now, link_pub=None):
         tty.setcbreak(sys.stdin.fileno())
 
     print(f"btrack_clock | backend: {backend}")
+    print(f"route audio into the '{args.client_name}' node and the MIDI clock "
+          f"out of it in qpwgraph / helvum / aconnect")
     if link_pub is not None:
         print(f"ableton link: enabled (quantum {link_pub.quantum:g}) - "
               f"turn on Link in Reaper/Bitwig and they will find this session")
-    print(f"route audio into '{args.client_name}:audio_in' and MIDI out of "
-          f"'{args.client_name}:midi_clock_out' (qpwgraph / helvum / aconnect)")
     if interactive:
         print("keys: [t]ap tempo  [h]alf  [d]ouble  [n]ormal  [f]reeze  "
               "[s]tart/stop  [r]eset  [q]uit")
@@ -975,8 +1085,13 @@ def main():
         description="Real-time beat tracker (BTrack) to MIDI clock for PipeWire.",
         epilog="Route any audio source into '<client>:audio_in' with qpwgraph, "
                "and '<client>:midi_clock_out' into Reaper/Bitwig/OP-Z.")
-    parser.add_argument("--backend", choices=("auto", "jack", "alsa"), default="auto",
-                        help="audio/midi backend (default: try jack, fall back to alsa)")
+    parser.add_argument("--backend", choices=("auto", "pipewire", "jack", "alsa"),
+                        default="auto",
+                        help="audio/midi backend (default: try pipewire, then "
+                             "jack, then alsa)")
+    parser.add_argument("--pw-target", default=None,
+                        help="pipewire backend: node to capture from (default: "
+                             "the default source; re-route in qpwgraph anytime)")
     parser.add_argument("--client-name", default="BTrack",
                         help="client name shown in qpwgraph (default: BTrack)")
     parser.add_argument("--min-bpm", type=float, default=80.0,
@@ -1036,20 +1151,19 @@ def main():
         worker = BeatWorker(engine, sample_rate, audio_queue, stop_event)
         return engine, worker
 
-    if args.backend in ("auto", "jack"):
+    backends = {"pipewire": run_pipewire, "jack": run_jack, "alsa": run_alsa}
+    order = (["pipewire", "jack", "alsa"] if args.backend == "auto"
+             else [args.backend])
+    for i, name in enumerate(order):
         try:
-            sys.exit(run_jack(args, make_worker))
+            sys.exit(backends[name](args, make_worker))
         except Exception as exc:
-            if args.backend == "jack":
-                print(f"error: jack backend failed: {exc}", file=sys.stderr)
+            if i < len(order) - 1:
+                print(f"{name} backend unavailable ({exc}), "
+                      f"trying {order[i + 1]} ...")
+            else:
+                print(f"error: {name} backend failed: {exc}", file=sys.stderr)
                 sys.exit(1)
-            print(f"jack/pipewire unavailable ({exc}), falling back to alsa ...")
-
-    try:
-        sys.exit(run_alsa(args, make_worker))
-    except Exception as exc:
-        print(f"error: alsa backend failed: {exc}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
